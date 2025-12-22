@@ -1,13 +1,8 @@
 [package]
 name = "zone-map"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-base64 = "0.22.1"
-flate2 = "1.1.5"
-wow-adt = "0.3.2"
-wow-blp = "0.3.2"
-wow-mpq = "0.3.2"
-wow-wdl = "0.3.2"
-wow-wdt = "0.3.2"
+base64 = "0.22"
+wow-adt = "0.3"

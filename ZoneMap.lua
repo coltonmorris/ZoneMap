@@ -74,13 +74,12 @@ local function base64_decode(s)
 end
 
 -- -------------------------
--- Tile decode: base64 -> deflate -> raw bytes
+-- Tile decode: base64 -> raw bytes (no compression)
 -- -------------------------
 local function decode_tile_blob(blob)
   if not blob then return nil end
-  local compressed = base64_decode(blob)
-  if not compressed then return nil end
-  return LibDeflate:DecompressDeflate(compressed)
+  -- No compression - just base64 decode directly to raw bytes
+  return base64_decode(blob)
 end
 
 local function tile_key(tileX, tileY)
@@ -860,7 +859,8 @@ local function CreateZoneOverlay()
   
   local frame = CreateFrame("Frame", "ZoneMapZoneOverlay", WorldMapFrame:GetCanvas())
   frame:SetAllPoints()
-  frame:SetFrameStrata("MEDIUM")  -- Below grid overlay
+  frame:SetFrameStrata("TOOLTIP")  -- Above fog of war and most other layers
+  frame:SetFrameLevel(100)  -- High frame level within strata
   
   zoneOverlay = frame
   return frame
@@ -915,53 +915,84 @@ local function UpdateZoneOverlay()
     return 
   end
   
-  -- Calculate visible tile range
-  local minWX, maxWX = math.min(p00.x, p11.x), math.max(p00.x, p11.x)
-  local minWY, maxWY = math.min(p00.y, p11.y), math.max(p00.y, p11.y)
+  -- Get player's current position and area ID
+  local playerAreaID = nil
+  local playerTileX, playerTileY = nil, nil
+  local playerMapID = C_Map.GetBestMapForUnit("player")
+  if playerMapID then
+    local playerPos = C_Map.GetPlayerMapPosition(playerMapID, "player")
+    if playerPos then
+      local playerWorldPos = get_world_pos(playerMapID, playerPos.x, playerPos.y)
+      if playerWorldPos then
+        -- Convert player world pos to tile/chunk
+        local pwX, pwY = playerWorldPos.y, playerWorldPos.x  -- swap axes
+        playerTileX = math.floor((ADT_HALF_SIZE - pwX) / ADT_TILE_SIZE)
+        playerTileY = math.floor((ADT_HALF_SIZE - pwY) / ADT_TILE_SIZE)
+        
+        -- Calculate chunk within tile
+        local tileOriginX = ADT_HALF_SIZE - playerTileX * ADT_TILE_SIZE
+        local tileOriginY = ADT_HALF_SIZE - playerTileY * ADT_TILE_SIZE
+        local withinTileX = (tileOriginX - pwX) / ADT_TILE_SIZE
+        local withinTileY = (tileOriginY - pwY) / ADT_TILE_SIZE
+        local playerChunkX = math.floor(withinTileX * 16)
+        local playerChunkY = math.floor(withinTileY * 16)
+        
+        -- Clamp to valid range
+        playerTileX = math.max(0, math.min(63, playerTileX))
+        playerTileY = math.max(0, math.min(63, playerTileY))
+        playerChunkX = math.max(0, math.min(15, playerChunkX))
+        playerChunkY = math.max(0, math.min(15, playerChunkY))
+        
+        playerAreaID = addon:GetAreaIdForChunk(gridName, playerTileX, playerTileY, playerChunkX, playerChunkY)
+        
+        if zoneDebug and playerAreaID then
+          local areaName = addon:GetAreaName(playerAreaID) or "Unknown"
+          print(string.format("zonemap: player at tile[%d,%d] chunk[%d,%d] = areaID %d (%s)",
+            playerTileX, playerTileY, playerChunkX, playerChunkY, playerAreaID, areaName))
+        end
+      end
+    end
+  end
   
-  local minTileX = math.max(0, math.floor((ADT_HALF_SIZE - maxWY) / ADT_TILE_SIZE) - 1)
-  local maxTileX = math.min(63, math.ceil((ADT_HALF_SIZE - minWY) / ADT_TILE_SIZE) + 1)
-  local minTileY = math.max(0, math.floor((ADT_HALF_SIZE - maxWX) / ADT_TILE_SIZE) - 1)
-  local maxTileY = math.min(63, math.ceil((ADT_HALF_SIZE - minWX) / ADT_TILE_SIZE) + 1)
+  if not playerAreaID or playerAreaID == 0 or not playerTileX then
+    if zoneDebug then print("zonemap: couldn't determine player's position/area ID") end
+    return
+  end
   
-  -- Calculate how many tiles are visible
-  local visibleTilesX = maxTileX - minTileX + 1
-  local visibleTilesY = maxTileY - minTileY + 1
-  local totalVisibleTiles = visibleTilesX * visibleTilesY
+  -- 5x5 tile grid: player tile ± 2 (covers more of the zone)
+  local minTileX = math.max(0, playerTileX - 2)
+  local maxTileX = math.min(63, playerTileX + 2)
+  local minTileY = math.max(0, playerTileY - 2)
+  local maxTileY = math.min(63, playerTileY + 2)
   
   if zoneDebug then 
-    print(string.format("zonemap: mapID=%d tiles=[%d-%d, %d-%d] (%d total)", 
-      mapID, minTileX, maxTileX, minTileY, maxTileY, totalVisibleTiles))
+    print(string.format("zonemap: 5x5 grid around tile[%d,%d] = tiles[%d-%d, %d-%d]", 
+      playerTileX, playerTileY, minTileX, maxTileX, minTileY, maxTileY))
   end
   
-  -- Determine sampling rate based on zoom level
-  -- More tiles visible = sample fewer chunks
+  -- Full 16x16 chunk detail (need full coverage to not miss zone boundaries)
   local chunkStep = 1
-  if totalVisibleTiles > 30 then
-    chunkStep = 2  -- Sample every other chunk
-  end
-  if totalVisibleTiles > 60 then
-    chunkStep = 4  -- Sample every 4th chunk
-  end
-  if totalVisibleTiles > 150 then
-    chunkStep = 8  -- Sample every 8th chunk (very coarse)
-  end
   
   local texIdx = 0
   local labelIdx = 0
   
-  -- Chunk size in world coordinates (adjusted for step)
+  -- Chunk size in world coordinates (scaled by step size, with slight overlap to fill gaps)
   local baseChunkWorldSize = ADT_TILE_SIZE / 16
-  local chunkWorldSize = baseChunkWorldSize * chunkStep
+  local chunkWorldSize = baseChunkWorldSize * chunkStep * 1.05  -- 5% larger to fill gaps
   
   -- Track zone centroids for labels
   local zoneCentroids = {}  -- areaID -> {sumX, sumY, count, name}
+  
+  -- Debug: track what areaIDs we find
+  local foundAreaIDs = {}
+  local tilesWithData = 0
   
   -- Draw each chunk as a colored square
   for tileX = minTileX, maxTileX do
     for tileY = minTileY, maxTileY do
       local key = tile_key(tileX, tileY)
       if grid.tiles and grid.tiles[key] then
+        tilesWithData = tilesWithData + 1
         -- Decode tile data
         local cache = get_cache(gridName)
         local raw = cache_get(cache, key)
@@ -983,14 +1014,22 @@ local function UpdateZoneOverlay()
               end
               
               local areaID = area_id_from_raw(raw, chunkX, chunkY)
+              
+              -- Track all area IDs found for debugging
               if areaID and areaID ~= 0 then
+                foundAreaIDs[areaID] = (foundAreaIDs[areaID] or 0) + 1
+              end
+              
+              -- Only draw chunks that match player's current zone
+              if areaID and areaID == playerAreaID then
                 -- Calculate chunk world position using same approach as adtgrid labels
                 -- Tile center: ADT_HALF_SIZE - (tile + 0.5) * ADT_TILE_SIZE
                 -- Chunk offset from tile center: (chunk - 7.5) / 16 * ADT_TILE_SIZE
                 -- chunkY is row (0=north edge of tile, 15=south edge)
                 -- chunkX is col (0=west edge of tile, 15=east edge)
-                local chunkOffsetRow = (chunkY + (chunkStep - 1) / 2 - 7.5) / 16
-                local chunkOffsetCol = (chunkX + (chunkStep - 1) / 2 - 7.5) / 16
+                -- chunkX/chunkY swapped for correct orientation
+                local chunkOffsetRow = (chunkX + (chunkStep - 1) / 2 - 7.5) / 16
+                local chunkOffsetCol = (chunkY + (chunkStep - 1) / 2 - 7.5) / 16
                 local chunkWorldY = ADT_HALF_SIZE - (tileX + 0.5 + chunkOffsetRow) * ADT_TILE_SIZE
                 local chunkWorldX = ADT_HALF_SIZE - (tileY + 0.5 + chunkOffsetCol) * ADT_TILE_SIZE
                 
@@ -1017,8 +1056,9 @@ local function UpdateZoneOverlay()
                     zoneTextures[texIdx] = tex
                   end
                   
+                  -- Consistent color per area ID
                   local r, g, b = GetAreaColor(areaID)
-                  tex:SetColorTexture(r, g, b, 0.4)
+                  tex:SetColorTexture(r, g, b, 0.8)
                   tex:ClearAllPoints()
                   tex:SetPoint("TOPLEFT", canvas, "TOPLEFT", pixelX - pixelW/2, -(pixelY - pixelH/2))
                   tex:SetSize(pixelW, pixelH)
@@ -1055,17 +1095,35 @@ local function UpdateZoneOverlay()
         labelIdx = labelIdx + 1
         local label = zoneLabels[labelIdx]
         if not label then
-          label = zoneOverlay:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-          label:SetFont(label:GetFont(), 11, "OUTLINE")
+          label = zoneOverlay:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+          label:SetFont(label:GetFont(), 14, "THICKOUTLINE")
           zoneLabels[labelIdx] = label
         end
         
-        local r, g, b = GetAreaColor(areaID)
-        label:SetTextColor(r, g, b, 1)
+        -- White text for visibility
+        label:SetTextColor(1, 1, 1, 1)
         label:ClearAllPoints()
         label:SetPoint("CENTER", canvas, "TOPLEFT", avgX, -avgY)
         label:SetText(centroid.name)
         label:Show()
+      end
+    end
+  end
+  
+  -- Debug output
+  if zoneDebug then
+    print(string.format("zonemap: drew %d chunks, %d tiles had data", texIdx, tilesWithData))
+    if texIdx == 0 then
+      -- Show what area IDs we DID find
+      local idList = {}
+      for id, count in pairs(foundAreaIDs) do
+        local name = addon:GetAreaName(id) or "?"
+        table.insert(idList, string.format("%d=%s(%d)", id, name, count))
+      end
+      if #idList > 0 then
+        print("zonemap: Looking for areaID " .. playerAreaID .. " but found: " .. table.concat(idList, ", "))
+      else
+        print("zonemap: No area IDs found in tile data!")
       end
     end
   end
@@ -1101,6 +1159,168 @@ end
 SLASH_ZONEMAP1 = "/zonemap"
 SlashCmdList.ZONEMAP = function()
   ToggleZoneOverlay()
+end
+
+-- =========================================================
+-- /adtfill <tileX>,<tileY> - Debug: draw all chunks for a specific tile
+-- =========================================================
+local fillOverlay = nil
+local fillTextures = {}
+
+SLASH_ADTFILL1 = "/adtfill"
+SlashCmdList.ADTFILL = function(msg)
+  -- Parse "X,Y" format
+  local centerTileX, centerTileY = msg:match("(%d+)%s*,?%s*(%d+)")
+  centerTileX, centerTileY = tonumber(centerTileX), tonumber(centerTileY)
+  
+  if not centerTileX or not centerTileY then
+    print("Usage: /adtfill <tileX>,<tileY>")
+    print("Example: /adtfill 40,32")
+    print("Draws the specified tile and all 8 neighbors (3x3 grid)")
+    return
+  end
+  
+  print(string.format("|cff00ff00Drawing 3x3 grid centered on tile [%d,%d]|r", centerTileX, centerTileY))
+  
+  -- Get map info
+  local mapID = WorldMapFrame:GetMapID()
+  if not mapID then
+    print("Open world map first!")
+    return
+  end
+  
+  local canvas = WorldMapFrame:GetCanvas()
+  local canvasWidth, canvasHeight = canvas:GetSize()
+  if canvasWidth == 0 then
+    print("Map canvas not ready")
+    return
+  end
+  
+  local p00 = get_world_pos(mapID, 0, 0)
+  local p11 = get_world_pos(mapID, 1, 1)
+  if not (p00 and p11) then
+    print("Couldn't get world pos for map")
+    return
+  end
+  
+  -- Get grid
+  local continentMapID = get_continent_map_id(mapID)
+  local _, _, gridName = continent_name_prefix_grid(continentMapID)
+  local grid = gridName and addon.tileGrids[gridName]
+  
+  if not grid or not grid.tiles then
+    print("|cffff0000No grid data found!|r")
+    return
+  end
+  
+  -- Create overlay if needed
+  if not fillOverlay then
+    fillOverlay = CreateFrame("Frame", "ZoneMapFillOverlay", WorldMapFrame:GetCanvas())
+    fillOverlay:SetAllPoints()
+    fillOverlay:SetFrameStrata("TOOLTIP")
+    fillOverlay:SetFrameLevel(200)
+  end
+  fillOverlay:Show()
+  
+  -- Hide old textures
+  for _, tex in ipairs(fillTextures) do
+    tex:Hide()
+  end
+  
+  local texIdx = 0
+  local baseChunkSize = ADT_TILE_SIZE / 16
+  local allAreaCounts = {}
+  local tilesDrawn = 0
+  
+  -- Draw 3x3 grid of tiles
+  for tileOffsetX = -1, 1 do
+    for tileOffsetY = -1, 1 do
+      local tileX = centerTileX + tileOffsetX
+      local tileY = centerTileY + tileOffsetY
+      
+      -- Skip out of bounds
+      if tileX >= 0 and tileX <= 63 and tileY >= 0 and tileY <= 63 then
+        local key = tile_key(tileX, tileY)
+        
+        if grid.tiles[key] then
+          local raw = decode_tile_blob(grid.tiles[key])
+          
+          if raw then
+            tilesDrawn = tilesDrawn + 1
+            print(string.format("  Drawing tile [%d,%d] (key=%d)", tileX, tileY, key))
+            
+            -- Draw all 16x16 chunks for this tile
+            for chunkY = 0, 15 do
+              for chunkX = 0, 15 do
+                local areaID = area_id_from_raw(raw, chunkX, chunkY)
+                
+                -- Track area counts
+                allAreaCounts[areaID] = (allAreaCounts[areaID] or 0) + 1
+                
+                -- Calculate world position (chunkX/chunkY swapped for correct orientation)
+                local chunkOffsetRow = (chunkX - 7.5) / 16
+                local chunkOffsetCol = (chunkY - 7.5) / 16
+                local chunkWorldY = ADT_HALF_SIZE - (tileX + 0.5 + chunkOffsetRow) * ADT_TILE_SIZE
+                local chunkWorldX = ADT_HALF_SIZE - (tileY + 0.5 + chunkOffsetCol) * ADT_TILE_SIZE
+                
+                -- Convert to map coords
+                local nx = (chunkWorldY - p00.y) / (p11.y - p00.y)
+                local ny = (chunkWorldX - p00.x) / (p11.x - p00.x)
+                
+                local chunkNormWidth = baseChunkSize / math.abs(p11.y - p00.y)
+                local chunkNormHeight = baseChunkSize / math.abs(p11.x - p00.x)
+                
+                local pixelX = nx * canvasWidth
+                local pixelY = ny * canvasHeight
+                local pixelW = chunkNormWidth * canvasWidth * 1.05
+                local pixelH = chunkNormHeight * canvasHeight * 1.05
+                
+                texIdx = texIdx + 1
+                local tex = fillTextures[texIdx]
+                if not tex then
+                  tex = fillOverlay:CreateTexture(nil, "ARTWORK")
+                  fillTextures[texIdx] = tex
+                end
+                
+                -- Color based on area ID (or gray if 0)
+                if areaID and areaID ~= 0 then
+                  local r, g, b = GetAreaColor(areaID)
+                  tex:SetColorTexture(r, g, b, 0.7)
+                else
+                  tex:SetColorTexture(0.3, 0.3, 0.3, 0.5)  -- Gray for empty
+                end
+                
+                tex:ClearAllPoints()
+                tex:SetPoint("TOPLEFT", canvas, "TOPLEFT", pixelX - pixelW/2, -(pixelY - pixelH/2))
+                tex:SetSize(pixelW, pixelH)
+                tex:Show()
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  
+  print(string.format("Drew %d tiles, %d total chunks", tilesDrawn, texIdx))
+  
+  -- Print area ID summary
+  print("Area IDs found:")
+  for aid, count in pairs(allAreaCounts) do
+    if aid ~= 0 then
+      local name = addon:GetAreaName(aid) or "?"
+      print(string.format("  %d (%s): %d chunks", aid, name, count))
+    end
+  end
+end
+
+-- /adtclear - Clear the fill overlay
+SLASH_ADTCLEAR1 = "/adtclear"
+SlashCmdList.ADTCLEAR = function()
+  if fillOverlay then
+    fillOverlay:Hide()
+  end
+  print("Fill overlay cleared")
 end
 
 -- Update zone overlay when map changes
