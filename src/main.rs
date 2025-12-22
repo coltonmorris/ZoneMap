@@ -145,16 +145,16 @@ fn build_tile_export(adt_dir: &Path, continent_name: &str) -> Result<TileGridExp
     Ok(export)
 }
 
-fn generate_continent(dir_name: &str, continent_name: &str) {
+fn generate_continent(dir_name: &str, continent_name: &str, out_dir: &Path) {
     let adt_dir = PathBuf::from(dir_name);
-    let out_path = format!("{}_tiles.lua", continent_name);
+    let out_path = out_dir.join(format!("{}_tiles.lua", continent_name));
     
     match build_tile_export(&adt_dir, continent_name) {
         Ok(export) => {
-            if let Err(e) = export.export_lua(Path::new(&out_path)) {
-                eprintln!("Failed to write {}: {}", out_path, e);
+            if let Err(e) = export.export_lua(&out_path) {
+                eprintln!("Failed to write {}: {}", out_path.display(), e);
             } else {
-                println!("  Wrote: {}", out_path);
+                println!("  Wrote: {}", out_path.display());
             }
         }
         Err(e) => {
@@ -166,11 +166,21 @@ fn generate_continent(dir_name: &str, continent_name: &str) {
 fn main() {
     println!("ZoneMap Tile Generator\n");
     
+    // Create Data directory if it doesn't exist
+    let out_dir = Path::new("Data");
+    if !out_dir.exists() {
+        if let Err(e) = fs::create_dir(out_dir) {
+            eprintln!("Failed to create Data directory: {}", e);
+            return;
+        }
+        println!("Created Data/ directory");
+    }
+    
     // Generate Kalimdor tiles
-    generate_continent("kalimdor_adts", "Kalimdor");
+    generate_continent("kalimdor_adts", "Kalimdor", out_dir);
     
     // Generate Azeroth (Eastern Kingdoms) tiles
-    generate_continent("azeroth_adts", "Azeroth");
+    generate_continent("azeroth_adts", "Azeroth", out_dir);
     
     println!("\nDone!");
 }
