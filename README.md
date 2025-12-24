@@ -1,6 +1,8 @@
 # ZoneMap
 this repo draws the zones and subzones on your map in classic wow! click the button in the top right of the map to enable. an asterisk next to the area-id means this zone gives xp.
 
+![ZoneMap Screenshot](zonemap.jpg)
+
 ## Contributing
 ### ADT Files
 In WoWs game files there exists `.adt` files. These contain zone and subzone information for every portion of the map. I had a hard time parsing the game files from classic wow version 1.15x because the archiving method uses `CASC`, and `CASC` was too convoluted. Private servers use an older archiving method that is easier to parse, and using that gave us the `.adt` files we needed
@@ -22,4 +24,3 @@ To generate the files:
 ```
 cargo run
 ```
-
